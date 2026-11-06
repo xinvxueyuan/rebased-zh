@@ -1,0 +1,130 @@
+name: Build Chinese language pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Rebased 版本号 (例如 1.1.23)。留空则使用最新发行版"
+        required: false
+        default: ""
+      download_url:
+        description: "rebased.tar.gz 自定义下载地址。留空则自动从官方 Release 解析"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-zh-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve target release
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          url="${{ inputs.download_url }}"
+          if [ -n "$url" ]; then
+            if [ -z "$version" ]; then
+              version="$(printf '%s' "$url" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
+            fi
+          else
+            if [ -z "$version" ]; then
+              version="$(gh release view --repo DetachHead/rebased --json tagName -q .tagName)"
+            fi
+            url="$(gh release view "$version" --repo DetachHead/rebased --json assets \
+              -q '.assets[] | select(.name=="rebased.tar.gz") | .url')"
+          fi
+          [ -n "$version" ] || { echo "无法确定版本号" >&2; exit 1; }
+          [ -n "$url" ] || { echo "无法确定 rebased.tar.gz 下载地址" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "目标版本: $version"
+
+      - name: Skip if already built
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="assets/${{ steps.rel.outputs.version }}/localization-zh.jar"
+          if [ -f "$f" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "已存在 $f ，跳过构建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate language pack
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/make-zh-pack.sh \
+            --version "${{ steps.rel.outputs.version }}" \
+            --url "${{ steps.rel.outputs.url }}"
+
+      - name: Commit language pack
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "assets/${{ steps.rel.outputs.version }}/localization-zh.jar"
+          if git diff --cached --quiet; then
+            echo "无变更"
+            exit 0
+          fi
+          git commit -m "chore: build zh language pack for Rebased ${{ steps.rel.outputs.version }}"
+          git push
+
+      - name: Ensure release
+        id: relout
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="zh-${{ steps.rel.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release exists: $tag"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "Rebased zh ${{ steps.rel.outputs.version }}" \
+              --notes "简体中文语言包 for Rebased ${{ steps.rel.outputs.version }}" --prerelease
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          asset="assets/${{ steps.rel.outputs.version }}/localization-zh.jar"
+          gh release upload "${{ steps.relout.outputs.tag }}" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### 构建结果"
+            echo ""
+            echo "- Rebased 版本: \`${{ steps.rel.outputs.version }}\`"
+            echo "- 产物: \`assets/${{ steps.rel.outputs.version }}/localization-zh.jar\`"
+            echo "- 发布: \`${{ steps.relout.outputs.tag }}\`"
+            echo ""
+            echo "下载: https://github.com/${{ github.repository }}/releases/download/${{ steps.relout.outputs.tag }}/localization-zh.jar"
+          } >> "$GITHUB_STEP_SUMMARY"
